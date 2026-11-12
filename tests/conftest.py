@@ -6,6 +6,8 @@ import os
 import tempfile
 from pathlib import Path
 
+import pytest
+
 _TEST_ROOT = Path(tempfile.mkdtemp(prefix="ocr-archive-tests-"))
 os.environ.setdefault("ARCHIVE_DB_PATH", str(_TEST_ROOT / "bootstrap.db"))
 os.environ.setdefault("REBUILD_BATCH_DELAY_MS", "120")
@@ -13,7 +15,15 @@ os.environ.setdefault("REBUILD_BATCH_SIZE", "2")
 os.environ.setdefault("REBUILD_LEASE_SECONDS", "3")
 
 # Must be imported after the environment above is set.
+from app import clock  # noqa: E402
 from app.config import SETTINGS  # noqa: E402
+
+
+@pytest.fixture(autouse=True)
+def _reset_clock_controls():
+    clock.reset_test_controls()
+    yield
+    clock.reset_test_controls()
 
 
 def configure_database(path: Path) -> None:

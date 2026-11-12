@@ -6,11 +6,11 @@ import os
 import re
 import socket
 import sqlite3
-import time
 import uuid
 from datetime import datetime, timezone
 from typing import Any, Iterable
 
+from . import clock
 from .config import SETTINGS
 from .accents import VALID_POLICIES
 
@@ -73,6 +73,11 @@ CREATE TABLE IF NOT EXISTS rebuild_jobs (
     started_at TEXT,
     heartbeat_at REAL,
     finished_at TEXT,
+    -- Leases are measured against CLOCK_MONOTONIC (elapsed time), scoped by
+    -- the host boot id, so wall-clock corrections never expire or extend them.
+    heartbeat_mono REAL,
+    created_mono REAL,
+    boot_id TEXT,
     base_seq INTEGER NOT NULL DEFAULT 0,
     applied_seq INTEGER NOT NULL DEFAULT 0,
     processed_documents INTEGER NOT NULL DEFAULT 0,
@@ -88,7 +93,11 @@ WHERE state IN ('queued', 'building', 'catching_up', 'activating');
 
 
 def utc_now() -> str:
-    return datetime.now(timezone.utc).isoformat(timespec="milliseconds").replace("+00:00", "Z")
+    return (
+        datetime.fromtimestamp(clock.wall_now(), timezone.utc)
+        .isoformat(timespec="milliseconds")
+        .replace("+00:00", "Z")
+    )
 
 
 def fts_table_name(generation_id: int) -> str:
@@ -211,6 +220,16 @@ def init_db() -> None:
         if "owner_proc_start" not in job_columns:
             conn.execute("ALTER TABLE rebuild_jobs ADD COLUMN owner_proc_start TEXT")
 
+        # Monotonic lease columns, added to databases created before the
+        # wall-clock-safe heartbeat lease.  Active rows without them are from a
+        # previous code generation and are reclaimed below.
+        if "heartbeat_mono" not in job_columns:
+            conn.execute("ALTER TABLE rebuild_jobs ADD COLUMN heartbeat_mono REAL")
+        if "created_mono" not in job_columns:
+            conn.execute("ALTER TABLE rebuild_jobs ADD COLUMN created_mono REAL")
+        if "boot_id" not in job_columns:
+            conn.execute("ALTER TABLE rebuild_jobs ADD COLUMN boot_id TEXT")
+
         active_setting = conn.execute(
             "SELECT value FROM settings WHERE key = 'active_generation_id'"
         ).fetchone()
@@ -266,20 +285,42 @@ def init_db() -> None:
         conn.close()
 
 
-def _mark_orphaned_owner_jobs(conn: sqlite3.Connection) -> None:
+def _owner_process_is_gone(job: sqlite3.Row) -> bool:
+    """True when the recorded owner cannot be the live owner of this job."""
+
     host = socket.gethostname()
+    if job["owner_host"] != host:
+        return True
+    if not job["owner_pid"]:
+        return True
+    pid = int(job["owner_pid"])
+    if not pid_exists(pid):
+        return True
+    if job["owner_proc_start"] and process_start_token(pid) != job["owner_proc_start"]:
+        return True
+    return False
+
+
+def _mark_orphaned_owner_jobs(conn: sqlite3.Connection) -> None:
+    """Reclaim active jobs whose owner process is dead or comes from an older boot.
+
+    A non-owner worker restarting on the same host leaves the owner process
+    untouched, so this never marks a healthy in-progress job interrupted.
+    """
+
     rows = conn.execute(
-        "SELECT id, generation_id, owner_host, owner_pid, owner_proc_start FROM rebuild_jobs "
+        "SELECT id, generation_id, owner_host, owner_pid, owner_proc_start, boot_id "
+        "FROM rebuild_jobs "
         "WHERE state IN ('queued', 'building', 'catching_up', 'activating')"
     ).fetchall()
     now = utc_now()
+    current_boot = clock.boot_id()
     for row in rows:
-        owner_is_gone = row["owner_host"] != host
-        if row["owner_host"] == host and row["owner_pid"]:
-            pid = int(row["owner_pid"])
-            owner_is_gone = not pid_exists(pid)
-            if not owner_is_gone and row["owner_proc_start"]:
-                owner_is_gone = process_start_token(pid) != row["owner_proc_start"]
+        owner_is_gone = _owner_process_is_gone(row)
+        # A monotonic heartbeat stamped by a previous host boot is never
+        # comparable to the current clock; such an owner cannot still be alive.
+        if not owner_is_gone and row["boot_id"] is not None and row["boot_id"] != current_boot:
+            owner_is_gone = True
         if owner_is_gone:
             _mark_job_failed(
                 conn,
@@ -307,7 +348,7 @@ def _mark_job_failed(
                message = 'old index retained; rebuild can be retriggered'
          WHERE id = ? AND state IN ('queued', 'building', 'catching_up', 'activating')
         """,
-        (state, finished_at, error, time.time(), job_id),
+        (state, finished_at, error, clock.wall_now(), job_id),
     )
     conn.execute(
         """
@@ -338,23 +379,44 @@ def active_index(conn: sqlite3.Connection) -> sqlite3.Row:
 
 def _active_job(conn: sqlite3.Connection) -> sqlite3.Row | None:
     placeholders = ", ".join("?" for _ in ACTIVE_JOB_STATES)
+    # Order by insertion order rather than any clock-derived column: the
+    # unique index guarantees at most one active job anyway.
     return conn.execute(
         f"SELECT * FROM rebuild_jobs WHERE state IN ({placeholders}) "
-        "ORDER BY created_epoch DESC LIMIT 1",
+        "ORDER BY rowid DESC LIMIT 1",
         ACTIVE_JOB_STATES,
     ).fetchone()
 
 
-def _job_is_stale(job: sqlite3.Row, now_epoch: float) -> tuple[bool, str]:
-    host = socket.gethostname()
-    if job["owner_host"] == host and job["owner_pid"]:
-        pid = int(job["owner_pid"])
-        if not pid_exists(pid):
-            return True, "rebuild owner process is no longer running"
-        if job["owner_proc_start"] and process_start_token(pid) != job["owner_proc_start"]:
-            return True, "rebuild owner PID was reused by a restarted process"
-    heartbeat = job["heartbeat_at"] or job["created_epoch"]
-    if now_epoch - float(heartbeat) > SETTINGS.rebuild_lease_seconds:
+def _job_is_stale(job: sqlite3.Row) -> tuple[bool, str]:
+    """Decide reclaim eligibility using elapsed time, never the wall clock.
+
+    A dead/reused owner process or a monotonic reading from a previous host
+    boot makes the job immediately reclaimable.  Otherwise the heartbeat lease
+    is the elapsed monotonic time since the last heartbeat; adjusting the wall
+    clock forwards or backwards changes neither reading.
+    """
+
+    if _owner_process_is_gone(job):
+        return True, "rebuild owner process is no longer running"
+
+    boot = job["boot_id"]
+    heartbeat_mono = job["heartbeat_mono"]
+    if boot is None or heartbeat_mono is None:
+        # Row written by an older software version before monotonic leases.
+        # Its owner is alive (checked above), but it cannot renew a monotonic
+        # lease; reclaim it using the configured lease against wall time only
+        # as a legacy fallback.
+        heartbeat_wall = job["heartbeat_at"] or job["created_epoch"]
+        if clock.wall_now() - float(heartbeat_wall) > SETTINGS.rebuild_lease_seconds:
+            return True, "rebuild heartbeat lease expired (legacy wall-clock record)"
+        return False, ""
+
+    if boot != clock.boot_id():
+        return True, "rebuild owner heartbeat predates the current host boot"
+
+    elapsed = clock.mono_now() - float(heartbeat_mono)
+    if elapsed > SETTINGS.rebuild_lease_seconds:
         return True, "rebuild heartbeat lease expired"
     return False, ""
 
@@ -374,9 +436,8 @@ def claim_rebuild(target_policy: str | None) -> dict[str, Any]:
             target_policy = "fold" if current_policy == "keep" else "keep"
 
         running = _active_job(conn)
-        now_epoch = time.time()
         if running is not None:
-            stale, reason = _job_is_stale(running, now_epoch)
+            stale, reason = _job_is_stale(running)
             if stale:
                 _mark_job_failed(
                     conn,
@@ -415,13 +476,15 @@ def claim_rebuild(target_policy: str | None) -> dict[str, Any]:
 
         job_id = str(uuid.uuid4())
         claim_token = str(uuid.uuid4())
+        now_epoch = clock.wall_now()
+        now_mono = clock.mono_now()
         conn.execute(
             """
             INSERT INTO rebuild_jobs
                 (id, generation_id, from_policy, to_policy, state, claim_token,
                  owner_host, owner_pid, owner_proc_start, created_at, created_epoch,
-                 heartbeat_at, message)
-            VALUES (?, ?, ?, ?, 'queued', ?, ?, ?, ?, ?, ?, ?, ?)
+                 heartbeat_at, heartbeat_mono, created_mono, boot_id, message)
+            VALUES (?, ?, ?, ?, 'queued', ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)
             """,
             (
                 job_id,
@@ -435,6 +498,9 @@ def claim_rebuild(target_policy: str | None) -> dict[str, Any]:
                 now,
                 now_epoch,
                 now_epoch,
+                now_mono,
+                now_mono,
+                clock.boot_id(),
                 "queued for background rebuild",
             ),
         )
@@ -503,7 +569,7 @@ def get_status() -> dict[str, Any]:
         active = active_index(conn)
         running = _active_job(conn)
         latest = conn.execute(
-            "SELECT * FROM rebuild_jobs ORDER BY created_epoch DESC LIMIT 1"
+            "SELECT * FROM rebuild_jobs ORDER BY rowid DESC LIMIT 1"
         ).fetchone()
         generations = conn.execute(
             "SELECT * FROM generations ORDER BY id DESC LIMIT 20"
@@ -564,8 +630,8 @@ def mark_job_progress(
     conn = connect()
     try:
         begin_immediate(conn)
-        assignments = ["heartbeat_at = ?"]
-        params: list[Any] = [time.time()]
+        assignments = ["heartbeat_at = ?", "heartbeat_mono = ?"]
+        params: list[Any] = [clock.wall_now(), clock.mono_now()]
         if state is not None:
             assignments.append("state = ?")
             params.append(state)

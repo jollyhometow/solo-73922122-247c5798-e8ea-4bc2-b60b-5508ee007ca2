@@ -36,6 +36,27 @@ The delay is a demo-only aid and is `0` by default. Reset demo data with:
 docker compose down -v
 ```
 
+### Heartbeat lease demonstrations (no host clock change)
+
+The lease uses monotonic elapsed time, so correcting the server clock cannot
+falsely expire a healthy rebuild or preserve a dead one. Two host-clock-free
+demos are shipped:
+
+```bash
+# In-process walkthrough: forward wall jump, backward wall jump, and a
+# paused-owner takeover with the resumed owner fenced. The wall clock is
+# shifted only inside the demo process; CLOCK_MONOTONIC is untouched.
+docker compose exec api python -m demo.lease_demo
+
+# Against the real two-worker service over HTTP: the owner worker is frozen
+# with SIGSTOP/SIGCONT (its PID stays alive but heartbeats stop) and the other
+# worker takes over after the real elapsed lease.
+REBUILD_LEASE_SECONDS=5 ./demo/docker_lease_demo.sh
+```
+
+The same scenarios are covered by `tests/test_lease_clock.py`.
+
+
 ## Swagger demo
 
 Every step is available with **Try it out** on `/docs`. The OpenAPI description
@@ -194,11 +215,28 @@ schema.
 * **One rebuild across processes** — `rebuild_jobs` has a partial unique index
   on active states. Claiming is done under `BEGIN IMMEDIATE`, so two API
   processes cannot start two jobs; the loser returns the current job.
+* **Wall-clock-safe heartbeat lease** — lease expiry is measured with
+  `CLOCK_MONOTONIC` (real elapsed time) in `heartbeat_mono`, never with the
+  adjustable wall clock. Correcting the server time forwards or backwards
+  therefore neither expires a healthy job nor keeps a dead job alive forever.
+  Monotonic readings are scoped by the host boot id (`boot_id`); wall-clock
+  epochs and ISO UTC strings remain only for the status display. A job is
+  reclaimable when its owner process is dead/reused, the reading predates the
+  current boot, or the elapsed-time lease runs out. The lease cannot be
+  disabled and PID liveness alone never grants an extension.
+* **Restart and pause semantics** — restarting the non-owner worker on the
+  same host never touches an active job, so it neither restarts the lease
+  countdown nor interrupts an in-progress rebuild. When the owner process
+  exits (or is frozen past its lease, e.g. `SIGSTOP`), another worker takes
+  over after the lease. A resumed old worker is fenced by its claim token: its
+  heartbeats, failure bookkeeping and index activation are all rejected and
+  cannot affect the new job.
 * **Failure/interruption** — the previous active generation is never changed
   until final commit. A failed job marks only its shadow generation failed. A
-  new process marks a dead owner's job interrupted at startup (dead PID or a
-  different container host), so the rebuild can be retriggered immediately.
-  Canonical pages and the change log survive in SQLite.
+  new process marks a dead owner's job interrupted at startup (dead PID, a
+  different container host, or a stale host-boot id), so the rebuild can be
+  retriggered immediately. Canonical pages and the change log survive in
+  SQLite.
 * **Fencing** — the final activation re-checks the job's claim token and
   active state under the write lock, so a stale worker that resumes cannot
   switch an obsolete generation after a newer job has been claimed.
@@ -216,7 +254,7 @@ generation history is visible in `/api/index/status`.
 | Variable | Default | Meaning |
 |---|---|---|
 | `ARCHIVE_DB_PATH` | `./data/archive.db` locally, `/data/archive.db` in Docker | SQLite path. |
-| `REBUILD_LEASE_SECONDS` | `20` | Heartbeat lease before a trigger may reclaim a job. |
+| `REBUILD_LEASE_SECONDS` | `20` | Elapsed-time (`CLOCK_MONOTONIC`) heartbeat lease before a trigger may reclaim a job; unaffected by wall-clock changes. |
 | `REBUILD_BATCH_SIZE` | `500` | Scan/catch-up batch size. |
 | `REBUILD_BATCH_DELAY_MS` | `0` | Demo-only pacing per batch. |
 | `DB_BUSY_TIMEOUT_SECONDS` | `30` | SQLite writer wait. |
@@ -235,4 +273,7 @@ pytest -q
 
 The tests exercise exact vs folded search, a rebuild that finishes with a
 correction and a deletion submitted during the scan, duplicate job idempotency,
-and restart/stale-job recovery. They use temporary SQLite files.
+restart/stale-job recovery, and the monotonic heartbeat lease under simulated
+wall-clock forward/backward jumps, a paused-owner takeover with claim-token
+fencing, non-owner restarts, and an upgrade from the pre-fix database schema.
+They use temporary SQLite files and never modify the host clock.

@@ -11,10 +11,10 @@ from __future__ import annotations
 
 import logging
 import threading
-import time
 
 import sqlite3
 
+from . import clock
 from .accents import normalize_for_policy
 from .config import SETTINGS
 from .db import (
@@ -180,6 +180,9 @@ def _run_worker(
 def _check_stop(job_id: str, claim_token: str, stop_event: threading.Event) -> None:
     if stop_event.is_set():
         raise RebuildCancelled("process shutdown requested")
+    # Demo/test seam: blocks the worker at a safe batch boundary (no SQLite
+    # transaction held) to emulate a frozen/SIGSTOPped owner process.
+    clock.run_pause_hook(job_id)
     if not job_is_owned(job_id, claim_token):
         raise RebuildCancelled("rebuild job was superseded or interrupted")
     if SETTINGS.rebuild_batch_delay_ms:
@@ -438,8 +441,9 @@ def _activate(
 
             conn.execute(
                 "UPDATE rebuild_jobs SET state = 'activating', heartbeat_at = ?, "
-                "message = 'final catch-up and atomic index switch' WHERE id = ?",
-                (time.time(), job_id),
+                "heartbeat_mono = ?, message = 'final catch-up and atomic index switch' "
+                "WHERE id = ? AND claim_token = ?",
+                (clock.wall_now(), clock.mono_now(), job_id, claim_token),
             )
 
             # The write lock is held only for this final catch-up and the
@@ -503,13 +507,15 @@ def _activate(
             conn.execute(
                 """
                 UPDATE rebuild_jobs
-                   SET state = 'succeeded', heartbeat_at = ?, finished_at = ?,
+                   SET state = 'succeeded', heartbeat_at = ?, heartbeat_mono = ?,
+                       finished_at = ?,
                        applied_seq = ?, total_documents = ?, processed_documents = ?,
                        error = NULL,
                        message = 'new index active; switch completed atomically'
                  WHERE id = ?
                 """,
-                (time.time(), now, applied_seq, page_count, page_count, job_id),
+                (clock.wall_now(), clock.mono_now(), now, applied_seq, page_count,
+                 page_count, job_id),
             )
             conn.commit()
         except Exception:
